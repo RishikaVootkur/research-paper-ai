@@ -69,7 +69,7 @@ research-paper-ai/
 
 ```bash
 # Clone the repo
-git clone https://github.com/YOUR_USERNAME/research-paper-ai.git
+git clone https://github.com/RishikaVootkur/research-paper-ai.git
 cd research-paper-ai
 
 # Create virtual environment
