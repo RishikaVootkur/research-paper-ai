@@ -5,6 +5,8 @@ Core Retrieval-Augmented Generation pipeline.
 Takes a user question, retrieves relevant paper chunks,
 and generates a grounded, cited answer.
 
+Now uses HybridRetriever (vector + BM25) for better retrieval.
+
 Usage:
     from src.rag.rag_chain import RAGChain
     rag = RAGChain()
@@ -21,13 +23,11 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
-from src.ingestion.vector_store import VectorStore
+from src.rag.hybrid_retriever import HybridRetriever, RetrievedChunk
 
 load_dotenv()
 
 
-# The system prompt is the most important part of RAG.
-# It tells the LLM exactly how to behave.
 RAG_SYSTEM_PROMPT = """You are a research assistant that answers questions based ONLY on the provided source material from academic papers.
 
 RULES:
@@ -49,10 +49,8 @@ Provide a detailed, well-cited answer based on the sources above."""
 
 class RAGChain:
     """
-    Core RAG pipeline: Question → Retrieve → Generate → Answer with citations.
-
-    This is the "brain" of the system. It connects the vector store
-    (where paper chunks live) with the LLM (which generates answers).
+    Core RAG pipeline with hybrid retrieval.
+    Question → Hybrid Retrieve → Generate → Answer with citations.
     """
 
     def __init__(
@@ -62,25 +60,28 @@ class RAGChain:
         model_name: str = "llama-3.3-70b-versatile",
         temperature: float = 0.1,
         top_k: int = 5,
+        vector_weight: float = 0.5,
+        bm25_weight: float = 0.5,
     ):
         """
         Args:
             collection_name: ChromaDB collection to search
             persist_dir: Where ChromaDB data lives
             model_name: Which Groq model to use
-            temperature: LLM creativity (0.0 = deterministic, 1.0 = creative).
-                        We keep it low (0.1) for factual answers — we want
-                        accuracy, not creativity.
+            temperature: LLM creativity (low = factual)
             top_k: How many chunks to retrieve per query
+            vector_weight: Weight for semantic search in hybrid
+            bm25_weight: Weight for keyword search in hybrid
         """
-        # Initialize vector store (loads embedding model + ChromaDB)
-        self.vector_store = VectorStore(
+        # Initialize hybrid retriever (replaces plain vector store)
+        self.retriever = HybridRetriever(
             collection_name=collection_name,
             persist_dir=persist_dir,
+            vector_weight=vector_weight,
+            bm25_weight=bm25_weight,
         )
 
         # Initialize the LLM
-        # Groq gives us Llama 3.3 70B for free — a very capable model
         self.llm = ChatGroq(
             model=model_name,
             temperature=temperature,
@@ -90,89 +91,50 @@ class RAGChain:
         self.top_k = top_k
 
         # Build the prompt template
-        # ChatPromptTemplate creates a structured prompt with system + user messages
         self.prompt = ChatPromptTemplate.from_messages([
             ("system", RAG_SYSTEM_PROMPT),
             ("human", RAG_USER_PROMPT),
         ])
 
-        # Output parser — extracts the string content from the LLM response
+        # Build the LCEL chain
         self.output_parser = StrOutputParser()
-
-        # Build the LCEL chain: prompt → LLM → parse output
-        # Note: retrieval is NOT in the chain because we need to
-        # format the retrieved chunks before passing to the prompt
         self.chain = self.prompt | self.llm | self.output_parser
 
-        print("RAG Chain initialized.")
+        print("RAG Chain initialized (with hybrid retrieval).")
 
-    def _retrieve(self, query: str) -> list[dict]:
-        """
-        Retrieve relevant chunks from the vector store.
-
-        Args:
-            query: User's question
-
-        Returns:
-            List of retrieved chunks with metadata
-        """
-        results = self.vector_store.search(query, top_k=self.top_k)
-        return results
-
-    def _format_context(self, retrieved_chunks: list[dict]) -> str:
-        """
-        Format retrieved chunks into a string for the prompt.
-
-        This is crucial — how you present the sources to the LLM
-        directly affects the quality of its answer. We include:
-        - Source number for easy reference
-        - Paper title and page (so the LLM can cite properly)
-        - The actual content
-
-        Args:
-            retrieved_chunks: List of chunks from vector store search
-
-        Returns:
-            Formatted context string
-        """
-        if not retrieved_chunks:
+    def _format_context(self, chunks: list[RetrievedChunk]) -> str:
+        """Format retrieved chunks into a string for the prompt."""
+        if not chunks:
             return "No relevant sources found."
 
         context_parts = []
-        for i, chunk in enumerate(retrieved_chunks, 1):
-            meta = chunk["metadata"]
+        for i, chunk in enumerate(chunks, 1):
             context_parts.append(
                 f"[Source {i}] "
-                f"Paper: \"{meta['paper_title']}\" | "
-                f"Page: {meta['page_number']} | "
-                f"Authors: {meta.get('authors', 'Unknown')}\n"
-                f"{chunk['content']}"
+                f"Paper: \"{chunk.paper_title}\" | "
+                f"Page: {chunk.page_number} | "
+                f"Authors: {chunk.authors} | "
+                f"Match: {chunk.retrieval_method}\n"
+                f"{chunk.content}"
             )
 
         return "\n\n---\n\n".join(context_parts)
 
-    def _format_sources(self, retrieved_chunks: list[dict]) -> list[dict]:
-        """
-        Create a clean list of sources used in the answer.
-
-        This is returned alongside the answer so the user can
-        verify claims and read the original papers.
-        """
+    def _format_sources(self, chunks: list[RetrievedChunk]) -> list[dict]:
+        """Create a clean list of unique sources used."""
         sources = []
-        seen = set()  # Avoid duplicate papers in source list
+        seen = set()
 
-        for chunk in retrieved_chunks:
-            meta = chunk["metadata"]
-            paper_id = meta["paper_id"]
-
-            if paper_id not in seen:
-                seen.add(paper_id)
+        for chunk in chunks:
+            if chunk.paper_id not in seen:
+                seen.add(chunk.paper_id)
                 sources.append({
-                    "paper_id": paper_id,
-                    "title": meta["paper_title"],
-                    "authors": meta.get("authors", "Unknown"),
-                    "page": meta["page_number"],
-                    "distance": chunk["distance"],
+                    "paper_id": chunk.paper_id,
+                    "title": chunk.paper_title,
+                    "authors": chunk.authors,
+                    "page": chunk.page_number,
+                    "retrieval_method": chunk.retrieval_method,
+                    "score": chunk.score,
                 })
 
         return sources
@@ -181,29 +143,28 @@ class RAGChain:
         """
         Ask a question and get a grounded, cited answer.
 
-        This is the main method. It:
-        1. Retrieves relevant chunks
-        2. Formats them as context
-        3. Sends to LLM with our carefully crafted prompt
-        4. Returns the answer with sources
-
         Args:
             question: Natural language question
             top_k: Override default number of chunks to retrieve
 
         Returns:
-            Dictionary with:
-                - answer: The LLM's response (with citations)
-                - sources: List of papers used
-                - num_chunks_retrieved: How many chunks were used
-                - question: The original question (for logging)
+            Dictionary with answer, sources, and metadata
         """
         k = top_k or self.top_k
 
-        # Step 1: Retrieve
-        print(f"\n🔍 Retrieving top {k} chunks...")
-        retrieved = self._retrieve(question)
-        print(f"   Found {len(retrieved)} chunks from {len(set(r['metadata']['paper_id'] for r in retrieved))} papers")
+        # Step 1: Hybrid retrieve
+        print(f"\n🔍 Hybrid retrieving top {k} chunks...")
+        retrieved = self.retriever.search(question, top_k=k)
+
+        # Count unique papers and retrieval methods
+        paper_ids = set(r.paper_id for r in retrieved)
+        methods = [r.retrieval_method for r in retrieved]
+        hybrid_count = methods.count("hybrid")
+
+        print(f"   Found {len(retrieved)} chunks from {len(paper_ids)} papers")
+        print(f"   Retrieval methods: {hybrid_count} hybrid, "
+              f"{methods.count('vector_only')} vector-only, "
+              f"{methods.count('bm25_only')} bm25-only")
 
         # Step 2: Format context
         context = self._format_context(retrieved)
@@ -222,16 +183,14 @@ class RAGChain:
             "answer": answer,
             "sources": sources,
             "num_chunks_retrieved": len(retrieved),
+            "num_papers": len(paper_ids),
             "question": question,
         }
 
     def query_with_details(self, question: str, top_k: int = None) -> dict:
-        """
-        Like query(), but also returns the raw retrieved chunks.
-        Useful for debugging and evaluation.
-        """
+        """Like query(), but also returns raw retrieved chunks for debugging."""
         k = top_k or self.top_k
-        retrieved = self._retrieve(question)
+        retrieved = self.retriever.search(question, top_k=k)
         context = self._format_context(retrieved)
 
         answer = self.chain.invoke({
@@ -254,11 +213,10 @@ class RAGChain:
 if __name__ == "__main__":
     rag = RAGChain()
 
-    # Test with different types of questions
     questions = [
         "How does LoRA reduce memory usage during fine-tuning of large language models?",
-        "What is the attention mechanism and why is it important in transformers?",
-        "How does RAG improve the factual accuracy of language model outputs?",
+        "What are the main evaluation metrics used for RAG systems?",
+        "How does the attention mechanism work in transformers?",
     ]
 
     for question in questions:
@@ -269,8 +227,8 @@ if __name__ == "__main__":
         result = rag.query(question)
 
         print(f"\nANSWER:\n{result['answer']}")
-        print(f"\nSOURCES:")
+        print(f"\nSOURCES ({result['num_papers']} papers):")
         for src in result["sources"]:
-            print(f"  - {src['title'][:60]}... (page {src['page']})")
+            print(f"  - [{src['retrieval_method']}] {src['title'][:55]}... (p.{src['page']})")
 
         print(f"\n{'='*60}")
