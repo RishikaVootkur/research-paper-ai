@@ -5,14 +5,12 @@ Core Retrieval-Augmented Generation pipeline.
 Takes a user question, retrieves relevant paper chunks,
 and generates a grounded, cited answer.
 
-Now uses HybridRetriever (vector + BM25) for better retrieval.
+Retrieval pipeline: Hybrid Search (vector + BM25) → Cross-Encoder Re-rank → LLM
 
 Usage:
     from src.rag.rag_chain import RAGChain
     rag = RAGChain()
     response = rag.query("How does LoRA reduce memory during fine-tuning?")
-    print(response["answer"])
-    print(response["sources"])
 """
 
 import os
@@ -23,7 +21,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
-from src.rag.hybrid_retriever import HybridRetriever, RetrievedChunk
+from src.rag.reranker import RerankedRetriever, RetrievedChunk
 
 load_dotenv()
 
@@ -49,8 +47,8 @@ Provide a detailed, well-cited answer based on the sources above."""
 
 class RAGChain:
     """
-    Core RAG pipeline with hybrid retrieval.
-    Question → Hybrid Retrieve → Generate → Answer with citations.
+    Core RAG pipeline with hybrid retrieval and cross-encoder re-ranking.
+    Question → Hybrid Search (20 candidates) → Re-rank (top 5) → LLM → Cited Answer
     """
 
     def __init__(
@@ -60,6 +58,7 @@ class RAGChain:
         model_name: str = "llama-3.3-70b-versatile",
         temperature: float = 0.1,
         top_k: int = 5,
+        fetch_k: int = 20,
         vector_weight: float = 0.5,
         bm25_weight: float = 0.5,
     ):
@@ -69,12 +68,13 @@ class RAGChain:
             persist_dir: Where ChromaDB data lives
             model_name: Which Groq model to use
             temperature: LLM creativity (low = factual)
-            top_k: How many chunks to retrieve per query
+            top_k: Final number of chunks after re-ranking
+            fetch_k: Number of chunks to fetch before re-ranking
             vector_weight: Weight for semantic search in hybrid
             bm25_weight: Weight for keyword search in hybrid
         """
-        # Initialize hybrid retriever (replaces plain vector store)
-        self.retriever = HybridRetriever(
+        # Initialize the full retrieval pipeline (hybrid + reranker)
+        self.retriever = RerankedRetriever(
             collection_name=collection_name,
             persist_dir=persist_dir,
             vector_weight=vector_weight,
@@ -89,18 +89,17 @@ class RAGChain:
         )
 
         self.top_k = top_k
+        self.fetch_k = fetch_k
 
-        # Build the prompt template
+        # Build the prompt template and chain
         self.prompt = ChatPromptTemplate.from_messages([
             ("system", RAG_SYSTEM_PROMPT),
             ("human", RAG_USER_PROMPT),
         ])
-
-        # Build the LCEL chain
         self.output_parser = StrOutputParser()
         self.chain = self.prompt | self.llm | self.output_parser
 
-        print("RAG Chain initialized (with hybrid retrieval).")
+        print("RAG Chain initialized (hybrid retrieval + re-ranking).")
 
     def _format_context(self, chunks: list[RetrievedChunk]) -> str:
         """Format retrieved chunks into a string for the prompt."""
@@ -113,8 +112,7 @@ class RAGChain:
                 f"[Source {i}] "
                 f"Paper: \"{chunk.paper_title}\" | "
                 f"Page: {chunk.page_number} | "
-                f"Authors: {chunk.authors} | "
-                f"Match: {chunk.retrieval_method}\n"
+                f"Authors: {chunk.authors}\n"
                 f"{chunk.content}"
             )
 
@@ -133,8 +131,7 @@ class RAGChain:
                     "title": chunk.paper_title,
                     "authors": chunk.authors,
                     "page": chunk.page_number,
-                    "retrieval_method": chunk.retrieval_method,
-                    "score": chunk.score,
+                    "reranker_score": chunk.score,
                 })
 
         return sources
@@ -143,28 +140,23 @@ class RAGChain:
         """
         Ask a question and get a grounded, cited answer.
 
+        Pipeline: Hybrid Search (fetch 20) → Re-rank (keep 5) → LLM → Answer
+
         Args:
             question: Natural language question
-            top_k: Override default number of chunks to retrieve
+            top_k: Override default number of final chunks
 
         Returns:
             Dictionary with answer, sources, and metadata
         """
         k = top_k or self.top_k
 
-        # Step 1: Hybrid retrieve
-        print(f"\n🔍 Hybrid retrieving top {k} chunks...")
-        retrieved = self.retriever.search(question, top_k=k)
+        # Step 1: Retrieve and re-rank
+        print(f"\n🔍 Retrieving (hybrid + re-ranking)...")
+        retrieved = self.retriever.search(question, top_k=k, fetch_k=self.fetch_k)
 
-        # Count unique papers and retrieval methods
         paper_ids = set(r.paper_id for r in retrieved)
-        methods = [r.retrieval_method for r in retrieved]
-        hybrid_count = methods.count("hybrid")
-
-        print(f"   Found {len(retrieved)} chunks from {len(paper_ids)} papers")
-        print(f"   Retrieval methods: {hybrid_count} hybrid, "
-              f"{methods.count('vector_only')} vector-only, "
-              f"{methods.count('bm25_only')} bm25-only")
+        print(f"   {len(retrieved)} chunks from {len(paper_ids)} papers (re-ranked from {self.fetch_k} candidates)")
 
         # Step 2: Format context
         context = self._format_context(retrieved)
@@ -190,7 +182,7 @@ class RAGChain:
     def query_with_details(self, question: str, top_k: int = None) -> dict:
         """Like query(), but also returns raw retrieved chunks for debugging."""
         k = top_k or self.top_k
-        retrieved = self.retriever.search(question, top_k=k)
+        retrieved = self.retriever.search(question, top_k=k, fetch_k=self.fetch_k)
         context = self._format_context(retrieved)
 
         answer = self.chain.invoke({
@@ -216,7 +208,6 @@ if __name__ == "__main__":
     questions = [
         "How does LoRA reduce memory usage during fine-tuning of large language models?",
         "What are the main evaluation metrics used for RAG systems?",
-        "How does the attention mechanism work in transformers?",
     ]
 
     for question in questions:
@@ -229,6 +220,4 @@ if __name__ == "__main__":
         print(f"\nANSWER:\n{result['answer']}")
         print(f"\nSOURCES ({result['num_papers']} papers):")
         for src in result["sources"]:
-            print(f"  - [{src['retrieval_method']}] {src['title'][:55]}... (p.{src['page']})")
-
-        print(f"\n{'='*60}")
+            print(f"  - {src['title'][:55]}... (p.{src['page']}, score: {src['reranker_score']:.2f})")
