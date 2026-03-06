@@ -2,10 +2,9 @@
 RAG Chain
 ---------
 Core Retrieval-Augmented Generation pipeline.
-Takes a user question, retrieves relevant paper chunks,
-and generates a grounded, cited answer.
 
-Retrieval pipeline: Hybrid Search (vector + BM25) → Cross-Encoder Re-rank → LLM
+Full pipeline:
+    Question → Classify → Hybrid Search → Re-rank → Select Prompt → LLM → Cited Answer
 
 Usage:
     from src.rag.rag_chain import RAGChain
@@ -17,38 +16,26 @@ import os
 import sys
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
-from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 from src.rag.reranker import RerankedRetriever, RetrievedChunk
+from src.rag.prompts import (
+    classify_question,
+    get_prompt,
+    format_context,
+    format_sources_list,
+)
 
 load_dotenv()
 
 
-RAG_SYSTEM_PROMPT = """You are a research assistant that answers questions based ONLY on the provided source material from academic papers.
-
-RULES:
-1. Answer the question using ONLY the information in the provided sources.
-2. After every claim, cite the source using [Paper Title, Page X] format.
-3. If the sources don't contain enough information to answer, say "Based on the available sources, I cannot fully answer this question" and explain what you CAN say.
-4. Do NOT make up information or use knowledge outside of the provided sources.
-5. If sources from different papers disagree, mention both viewpoints.
-6. Be specific and technical — this is for researchers, not casual readers.
-7. Structure your answer clearly with logical flow."""
-
-RAG_USER_PROMPT = """SOURCES:
-{context}
-
-QUESTION: {question}
-
-Provide a detailed, well-cited answer based on the sources above."""
-
-
 class RAGChain:
     """
-    Core RAG pipeline with hybrid retrieval and cross-encoder re-ranking.
-    Question → Hybrid Search (20 candidates) → Re-rank (top 5) → LLM → Cited Answer
+    Production-quality RAG pipeline.
+
+    Retrieval: Hybrid Search (vector + BM25) → Cross-Encoder Re-rank
+    Generation: Question-type-aware prompts → Groq LLM → Cited answer
     """
 
     def __init__(
@@ -62,18 +49,7 @@ class RAGChain:
         vector_weight: float = 0.5,
         bm25_weight: float = 0.5,
     ):
-        """
-        Args:
-            collection_name: ChromaDB collection to search
-            persist_dir: Where ChromaDB data lives
-            model_name: Which Groq model to use
-            temperature: LLM creativity (low = factual)
-            top_k: Final number of chunks after re-ranking
-            fetch_k: Number of chunks to fetch before re-ranking
-            vector_weight: Weight for semantic search in hybrid
-            bm25_weight: Weight for keyword search in hybrid
-        """
-        # Initialize the full retrieval pipeline (hybrid + reranker)
+        # Initialize retrieval pipeline
         self.retriever = RerankedRetriever(
             collection_name=collection_name,
             persist_dir=persist_dir,
@@ -81,132 +57,108 @@ class RAGChain:
             bm25_weight=bm25_weight,
         )
 
-        # Initialize the LLM
+        # Initialize LLM
         self.llm = ChatGroq(
             model=model_name,
             temperature=temperature,
             max_tokens=2048,
         )
+        self.output_parser = StrOutputParser()
 
         self.top_k = top_k
         self.fetch_k = fetch_k
 
-        # Build the prompt template and chain
-        self.prompt = ChatPromptTemplate.from_messages([
-            ("system", RAG_SYSTEM_PROMPT),
-            ("human", RAG_USER_PROMPT),
-        ])
-        self.output_parser = StrOutputParser()
-        self.chain = self.prompt | self.llm | self.output_parser
-
-        print("RAG Chain initialized (hybrid retrieval + re-ranking).")
-
-    def _format_context(self, chunks: list[RetrievedChunk]) -> str:
-        """Format retrieved chunks into a string for the prompt."""
-        if not chunks:
-            return "No relevant sources found."
-
-        context_parts = []
-        for i, chunk in enumerate(chunks, 1):
-            context_parts.append(
-                f"[Source {i}] "
-                f"Paper: \"{chunk.paper_title}\" | "
-                f"Page: {chunk.page_number} | "
-                f"Authors: {chunk.authors}\n"
-                f"{chunk.content}"
-            )
-
-        return "\n\n---\n\n".join(context_parts)
-
-    def _format_sources(self, chunks: list[RetrievedChunk]) -> list[dict]:
-        """Create a clean list of unique sources used."""
-        sources = []
-        seen = set()
-
-        for chunk in chunks:
-            if chunk.paper_id not in seen:
-                seen.add(chunk.paper_id)
-                sources.append({
-                    "paper_id": chunk.paper_id,
-                    "title": chunk.paper_title,
-                    "authors": chunk.authors,
-                    "page": chunk.page_number,
-                    "reranker_score": chunk.score,
-                })
-
-        return sources
+        print("RAG Chain initialized (hybrid + re-ranking + smart prompts).")
 
     def query(self, question: str, top_k: int = None) -> dict:
         """
         Ask a question and get a grounded, cited answer.
 
-        Pipeline: Hybrid Search (fetch 20) → Re-rank (keep 5) → LLM → Answer
+        Pipeline:
+        1. Classify question type
+        2. Retrieve + re-rank relevant chunks
+        3. Select appropriate prompt template
+        4. Generate answer with LLM
+        5. Return answer with sources
 
         Args:
             question: Natural language question
-            top_k: Override default number of final chunks
+            top_k: Override default number of chunks
 
         Returns:
-            Dictionary with answer, sources, and metadata
+            Dictionary with answer, sources, question type, and metadata
         """
         k = top_k or self.top_k
 
-        # Step 1: Retrieve and re-rank
-        print(f"\n🔍 Retrieving (hybrid + re-ranking)...")
+        # Step 1: Classify question
+        question_type = classify_question(question)
+        print(f"\n📋 Question type: {question_type}")
+
+        # Step 2: Retrieve and re-rank
+        print(f"🔍 Retrieving (hybrid + re-ranking)...")
         retrieved = self.retriever.search(question, top_k=k, fetch_k=self.fetch_k)
 
         paper_ids = set(r.paper_id for r in retrieved)
-        print(f"   {len(retrieved)} chunks from {len(paper_ids)} papers (re-ranked from {self.fetch_k} candidates)")
+        print(f"   {len(retrieved)} chunks from {len(paper_ids)} papers")
 
-        # Step 2: Format context
-        context = self._format_context(retrieved)
+        # Step 3: Select prompt and build chain
+        prompt = get_prompt(question_type)
+        chain = prompt | self.llm | self.output_parser
 
-        # Step 3: Generate answer
+        # Step 4: Format context and generate
+        context = format_context(retrieved)
+
         print("🤖 Generating answer...")
-        answer = self.chain.invoke({
+        answer = chain.invoke({
             "context": context,
             "question": question,
         })
 
-        # Step 4: Format sources
-        sources = self._format_sources(retrieved)
+        # Step 5: Format sources
+        sources = format_sources_list(retrieved)
 
         return {
             "answer": answer,
             "sources": sources,
-            "num_chunks_retrieved": len(retrieved),
+            "question_type": question_type,
+            "num_chunks": len(retrieved),
             "num_papers": len(paper_ids),
             "question": question,
         }
 
     def query_with_details(self, question: str, top_k: int = None) -> dict:
-        """Like query(), but also returns raw retrieved chunks for debugging."""
+        """Like query(), but also returns retrieved chunks and context."""
         k = top_k or self.top_k
+        question_type = classify_question(question)
         retrieved = self.retriever.search(question, top_k=k, fetch_k=self.fetch_k)
-        context = self._format_context(retrieved)
+        context = format_context(retrieved)
 
-        answer = self.chain.invoke({
-            "context": context,
-            "question": question,
-        })
+        prompt = get_prompt(question_type)
+        chain = prompt | self.llm | self.output_parser
+        answer = chain.invoke({"context": context, "question": question})
 
         return {
             "answer": answer,
-            "sources": self._format_sources(retrieved),
+            "sources": format_sources_list(retrieved),
             "retrieved_chunks": retrieved,
             "formatted_context": context,
+            "question_type": question_type,
             "question": question,
         }
 
 
 # ============================================================
-# Test it
+# Test with different question types
 # ============================================================
 if __name__ == "__main__":
     rag = RAGChain()
 
     questions = [
-        "How does LoRA reduce memory usage during fine-tuning of large language models?",
+        # Methodology question
+        "How does the attention mechanism work in transformers?",
+        # Comparison question
+        "What are the advantages of LoRA compared to full fine-tuning?",
+        # Summary question
         "What are the main evaluation metrics used for RAG systems?",
     ]
 
@@ -217,7 +169,8 @@ if __name__ == "__main__":
 
         result = rag.query(question)
 
+        print(f"\n📝 Type: {result['question_type']}")
         print(f"\nANSWER:\n{result['answer']}")
         print(f"\nSOURCES ({result['num_papers']} papers):")
         for src in result["sources"]:
-            print(f"  - {src['title'][:55]}... (p.{src['page']}, score: {src['reranker_score']:.2f})")
+            print(f"  - {src['title'][:55]}... (p.{src['page']})")
