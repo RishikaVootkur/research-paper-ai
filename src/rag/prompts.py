@@ -21,7 +21,14 @@ CITATION_INSTRUCTIONS = """CITATION FORMAT (you MUST follow this exactly):
   [1] "Paper Title" — Authors (Page X)
   [2] "Paper Title" — Authors (Page X)
 - Only include sources you actually referenced in your answer.
-- If you cannot answer from the sources, state that clearly."""
+- If you cannot answer from the sources, state that clearly.
+
+CRITICAL GROUNDING RULES:
+- NEVER add information that is not explicitly stated in the sources.
+- If a source says "reduces parameters by 10,000x", say exactly that — do not round or paraphrase loosely.
+- Do NOT use your general knowledge to fill gaps. If the sources don't mention something, don't mention it.
+- It is better to give a shorter, fully grounded answer than a longer answer with unsupported claims.
+- Every single sentence in your answer must be traceable to a specific source."""
 
 
 # ============================================================
