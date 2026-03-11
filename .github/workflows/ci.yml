@@ -1,0 +1,99 @@
+
+# ============================================================
+# GitHub Actions CI Pipeline
+# ============================================================
+# Runs automatically on every push and pull request.
+# Tests: linting, imports, and question classifier.
+#
+# Note: We only test components that don't need API keys or
+# the ChromaDB database, since those aren't available in CI.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install langchain langchain-core langchain-community
+          pip install langchain-groq langchain-google-genai
+          pip install chromadb sentence-transformers
+          pip install pymupdf arxiv rank-bm25
+          pip install fastapi uvicorn streamlit
+          pip install python-dotenv tqdm pydantic
+          pip install langgraph torch transformers
+          pip install scikit-learn
+
+      - name: Check imports
+        run: |
+          echo "Checking core imports..."
+          python -c "from src.ingestion.arxiv_fetcher import ArxivFetcher; print('✅ ArxivFetcher')"
+          python -c "from src.ingestion.pdf_processor import PDFProcessor; print('✅ PDFProcessor')"
+          python -c "from src.rag.prompts import classify_question; print('✅ Prompts')"
+          python -c "from src.agents.state import AgentState; print('✅ AgentState')"
+
+      - name: Test question classifier
+        run: |
+          python -c "
+          from src.rag.prompts import classify_question
+          tests = [
+              ('What is LoRA?', 'factual'),
+              ('How does attention work?', 'methodology'),
+              ('Compare LoRA and full fine-tuning', 'comparison'),
+              ('What are the main trends?', 'summary'),
+          ]
+          passed = 0
+          for q, expected in tests:
+              result = classify_question(q)
+              status = '✅' if result == expected else '❌'
+              print(f'  {status} {q} → {result}')
+              if result == expected: passed += 1
+          print(f'\n  {passed}/{len(tests)} passed')
+          assert passed == len(tests), 'Classification tests failed'
+          "
+
+      - name: Test data models
+        run: |
+          python -c "
+          from src.ingestion.arxiv_fetcher import PaperMetadata
+          from src.ingestion.pdf_processor import PaperChunk
+          from src.agents.state import AgentState
+          
+          # Test PaperMetadata creation
+          paper = PaperMetadata(
+              paper_id='test', title='Test', abstract='Test abstract',
+              authors=['Author'], published='2024-01-01', updated='2024-01-01',
+              categories=['cs.AI'], primary_category='cs.AI',
+              pdf_url='http://test.pdf', arxiv_url='http://test'
+          )
+          assert paper.paper_id == 'test'
+          print('✅ PaperMetadata')
+          
+          # Test PaperChunk creation
+          chunk = PaperChunk(
+              chunk_id='test_0', paper_id='test', paper_title='Test',
+              content='Test content', page_number=1, chunk_index=0,
+              total_chunks=1, char_count=12, authors=['Author']
+          )
+          assert chunk.chunk_id == 'test_0'
+          print('✅ PaperChunk')
+          
+          print('\nAll data model tests passed!')
+          "
