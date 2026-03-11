@@ -8,7 +8,6 @@ __pycache__/
 data/raw_papers/
 data/processed/
 models/
-chroma_db/
 .DS_Store
 Thumbs.db
 .vscode/
