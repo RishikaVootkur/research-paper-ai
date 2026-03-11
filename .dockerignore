@@ -1,0 +1,9 @@
+# Don't copy these into the Docker image
+venv/
+__pycache__/
+*.pyc
+.git/
+.gitignore
+*.md
+.DS_Store
+notebooks/

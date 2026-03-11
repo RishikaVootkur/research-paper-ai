@@ -13,12 +13,12 @@ Each agent is a LangGraph node: takes AgentState, returns updated AgentState.
 import os
 import sys
 from dotenv import load_dotenv
-from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 from src.agents.state import AgentState
+from src.agents.llm_provider import get_llm
 from src.rag.reranker import RerankedRetriever
 from src.rag.query_transform import QueryTransformer
 from src.rag.prompts import format_context, format_sources_list, get_prompt, CITATION_INSTRUCTIONS
@@ -37,11 +37,7 @@ class RetrieverAgent:
     def __init__(self, retriever: RerankedRetriever, query_transformer: QueryTransformer):
         self.retriever = retriever
         self.query_transformer = query_transformer
-        self.llm = ChatGroq(
-            model="llama-3.3-70b-versatile",
-            temperature=0.1,
-            max_tokens=2048,
-        )
+        self.llm = get_llm(temperature=0.1)
         self.output_parser = StrOutputParser()
 
     def run(self, state: AgentState) -> AgentState:
@@ -118,11 +114,7 @@ class SynthesizerAgent:
     def __init__(self, retriever: RerankedRetriever, query_transformer: QueryTransformer):
         self.retriever = retriever
         self.query_transformer = query_transformer
-        self.llm = ChatGroq(
-            model="llama-3.3-70b-versatile",
-            temperature=0.2,  # Slightly more creative for synthesis
-            max_tokens=2048,
-        )
+        self.llm = get_llm(temperature=0.2)
         self.output_parser = StrOutputParser()
 
     def run(self, state: AgentState) -> AgentState:
@@ -186,11 +178,7 @@ class GeneralAgent:
     """
 
     def __init__(self):
-        self.llm = ChatGroq(
-            model="llama-3.3-70b-versatile",
-            temperature=0.5,
-            max_tokens=500,
-        )
+        self.llm = get_llm(temperature=0.5)
 
         self.prompt = ChatPromptTemplate.from_messages([
             ("system", """You are a helpful research assistant for ML/AI papers. 

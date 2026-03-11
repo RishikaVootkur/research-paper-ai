@@ -15,12 +15,12 @@ import os
 import sys
 import json
 from dotenv import load_dotenv
-from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 from src.agents.state import AgentState
+from src.agents.llm_provider import get_llm
 
 load_dotenv()
 
@@ -63,11 +63,7 @@ class RouterAgent:
     """
 
     def __init__(self):
-        self.llm = ChatGroq(
-            model="llama-3.3-70b-versatile",
-            temperature=0.0,
-            max_tokens=150,
-        )
+        self.llm = get_llm(temperature=0.0)
         self.chain = ROUTER_PROMPT | self.llm | StrOutputParser()
 
     def route(self, state: AgentState) -> AgentState:

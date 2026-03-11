@@ -1,0 +1,45 @@
+# ============================================================
+# Docker Compose — Research Paper Intelligence Platform
+# ============================================================
+# Runs the full stack: FastAPI backend + Streamlit frontend
+#
+# Usage:
+#   docker compose up --build        (build and start both services)
+#   docker compose up backend        (start only the API)
+#   docker compose up frontend       (start only the UI)
+#   docker compose down              (stop everything)
+
+services:
+  backend:
+    build: .
+    command: uvicorn src.api.app:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount these so data persists between container restarts
+      - ./chroma_db:/app/chroma_db
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./.env:/app/.env
+    environment:
+      - PYTHONUNBUFFERED=1
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  frontend:
+    build: .
+    command: streamlit run frontend/app.py --server.port 8501 --server.address 0.0.0.0
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./chroma_db:/app/chroma_db
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./.env:/app/.env
+    environment:
+      - PYTHONUNBUFFERED=1
+    depends_on:
+      - backend
